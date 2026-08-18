@@ -133,10 +133,95 @@ Full suite as of this checkpoint: `go build ./...` clean, `go vet ./...`
 clean, `go test ./... -race` → 7 packages, 50 tests, all passing, no data
 races detected.
 
+- `internal/runbooks` — honest keyword-overlap retrieval (explicitly NOT
+  semantic search; `MatchMethod` constant is always reported truthfully as
+  `"keyword-overlap"`, never invented as `"embedding-cosine"` or similar).
+  8/8 tests pass, including an integration test against the real
+  `runbooks/*.md` files confirming a "cpu saturation" query actually
+  surfaces `cpu.md` first.
+
 Remaining for Phase 1: `internal/api` (HTTP handlers matching
 `API_CONTRACT.md`), `cmd/vyomm-api` wiring, including the periodic
 background pruning call (currently `Prune` exists but nothing calls it on a
 schedule yet — that wiring belongs in `cmd/vyomm-api`, not the library).
+
+## Round 2 agent deliverables — Controller verification and fixes
+
+Both agents delivered substantial Round 2 work. Verified with real commands,
+two genuine bugs found and fixed (documented below so both agents know
+exactly what changed and why — neither was a case of "the agent didn't try,"
+both were subtle library-semantics issues).
+
+**Writer — `internal/observability/metrics` (Prometheus instrumentation):**
+Implements all 15 metrics from `METRICS_CONTRACT.md` with correct bounded
+label sets. Found and fixed one compile-time bug: the `Registry.Gatherer`
+field is statically typed as the narrower `prometheus.Gatherer` interface,
+but the test tried to pass it directly to `testutil.CollectAndCount`, which
+requires `prometheus.Collector` — `*prometheus.Registry` (the concrete
+runtime type) implements both interfaces, so a one-line type assertion in
+the test (`m.Gatherer.(prometheus.Collector)`) fixes it without changing
+`metrics.go`'s public API. Also fixed a second, semantic bug in
+`TestLabelsDoNotIncludeDeviceOrRun`: it asserted
+`testutil.CollectAndCount(m.TelemetryRecordsReceived) == 1` after using two
+distinct label combinations, but `CollectAndCount` on a `*CounterVec` counts
+time series (one per label combination), not metric families — the
+assertion could never pass as written. Rewrote it to correctly check both
+things the test actually intended: 2 time series for 2 distinct bounded
+label combinations, AND exactly 1 metric family/name via
+`Gatherer.Gather()`. 2/2 tests now pass.
+
+**Writer — `internal/observability/tracing` (OTel SDK setup):**
+Correct `Init()`/`Tracer()`/span-name-constants design. Found and fixed one
+test bug: `TestInMemorySpanRecords` checked `exporter.GetSpans()` *after*
+calling `provider.Shutdown()`, but `tracetest.InMemoryExporter.Shutdown()`
+calls `Reset()` internally, clearing recorded spans — so the assertion
+always saw 0 regardless of whether tracing worked. Confirmed via a
+throwaway debug test that spans ARE correctly recorded immediately after
+`span.End()` (before `Shutdown`); moved the assertion before the
+`Shutdown()` call. 2/2 tests now pass.
+
+**Writer — `cmd/vyomm-simulator`:** Minimal but working deterministic
+simulator (`math/rand/v2` with explicit seed, verified byte-identical JSON
+output for repeated seed+scenario). Currently supports 5 placeholder
+scenario names (`healthy-baseline`, `cpu-saturation`, `memory-pressure`,
+`high-latency`, `packet-loss`) rather than the full 9 required scenarios —
+expected, since it was built ahead of Thinker's `docs/scenarios.md` ground
+truth, which is still pending. Sends exactly one batch and exits, rather
+than looping continuously like the original Python simulator — will need
+extending once ground truth lands. 2/2 tests pass.
+
+**Writer — `.github/workflows/ci.yml`:** Correctly scoped to what exists
+(Go build/vet/gofmt/test-race + web test/build), no jobs for nonexistent
+targets (no kind/HAMi/acceptance job yet). Matches the exact commands
+verified locally above.
+
+**Writer — `deploy/docker/{vyomm-api,vyomm-simulator}.Dockerfile`:**
+Correctly marked `UNTESTED` since `cmd/vyomm-api` doesn't exist yet. Base
+image `golang:1.25-alpine` actually matches the real `go.mod` (`go 1.25.0`,
+auto-set by tooling) better than this plan's earlier stated "Go 1.23"
+target — **correction to this document**: the actual pinned Go version is
+**1.25.0**, not 1.23 as originally planned; 1.23 is superseded by reality
+and this is the authoritative correction.
+
+**Writer — light theme + accessibility fix (Round 1 followup):** Confirmed
+delivered and correct: `web/src/styles.css` now uses a light background
+(`#f5f7f8`)/dark text, `transition` properties in the 150–250ms range
+(180ms) on hover/focus states, visible `:focus-visible` outlines, and a
+`@media (prefers-reduced-motion: reduce)` block. `npm test` (4/4) and
+`npm run build` both still pass after the change.
+
+**Thinker — Round 2 (scenario ground truth + evaluation design):** Not yet
+delivered at this checkpoint (`docs/scenarios.md` still the Round-1
+skeleton, `docs/evaluation-design.md` does not exist yet). Not a problem —
+just recorded honestly as pending.
+
+Full repo state after these fixes: `go build ./...` clean, `go vet ./...`
+clean, `gofmt -l .` empty, `go test ./... -race` → **11 packages, 63 tests,
+all passing**, `web`: 4/4 tests passing, production build succeeds.
+`go mod tidy` run to reconcile direct/indirect dependency declarations
+after both agents' `go get` calls; all pinned versions preserved exactly
+(`client_golang` v1.20.5, `otel` family v1.32.0, `goose` v3.24.1,
+`modernc.org/sqlite` v1.34.4).
 
 ## Phase 4 progress (Thinker agent — HAMi/kind design)
 
