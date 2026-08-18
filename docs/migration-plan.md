@@ -111,11 +111,32 @@ Done and verified with passing `go test`:
 Full suite as of this checkpoint: `go build ./...` clean, `go vet ./...`
 clean, `go test ./...` → 6 packages, 42 tests, all passing.
 
-Remaining for Phase 1: `internal/persistence` (SQLite + goose migrations,
-restart restore, retention pruning — this is where the Store above gets a
-durable backing store and where the other confirmed defect, "written but
-never restored," gets fixed), `internal/api` (HTTP handlers matching
-`API_CONTRACT.md`), `cmd/vyomm-api` wiring.
+- `internal/persistence` — SQLite (via `modernc.org/sqlite`, pure-Go, no
+  CGO) + goose migrations (`00001_init.sql`: `telemetry`, `incidents`,
+  `incident_decisions` tables), 8/8 tests pass, including:
+  - `TestRestore_SurvivesRestart` — direct regression test for "written but
+    never restored": closes the store, reopens against the same file,
+    asserts telemetry history and incidents are both present in memory
+    afterward (the original Python bug: this returned empty in the audit).
+  - `TestRestore_RecurrenceHistoryPreservedAcrossRestart` — combines both
+    fixed defects: resolve an incident, restart, re-detect the same fault,
+    assert a new occurrence is created (not suppressed) and both
+    occurrences survive in restored history.
+  - `TestPrune_RemovesRowsOlderThanRetention` — direct regression test for
+    unbounded growth: ingests one row inside and one outside the retention
+    window, asserts `Prune` removes exactly the one outside it.
+  - `TestIngest_RejectsInvalidRowsWithReason` — invalid rows are rejected
+    with a recorded reason string, never silently dropped or silently
+    stored malformed.
+
+Full suite as of this checkpoint: `go build ./...` clean, `go vet ./...`
+clean, `go test ./... -race` → 7 packages, 50 tests, all passing, no data
+races detected.
+
+Remaining for Phase 1: `internal/api` (HTTP handlers matching
+`API_CONTRACT.md`), `cmd/vyomm-api` wiring, including the periodic
+background pruning call (currently `Prune` exists but nothing calls it on a
+schedule yet — that wiring belongs in `cmd/vyomm-api`, not the library).
 
 ## Phase 4 progress (Thinker agent — HAMi/kind design)
 
@@ -164,7 +185,58 @@ Controller verification performed and passing:
   (146.62 kB JS gzip 47.26 kB) — production build path confirmed working,
   not a dev-server placeholder.
 
-**Not yet verified:** whether `web/src/fixtures/` shapes match
-`API_CONTRACT.md` field-for-field (pending a full component-by-component
-diff), and whether the Prometheus/OTel configs actually scrape/receive data
-(no live stack has been started yet).
+### Deep verification pass (Controller, second review)
+
+**Fixture/contract field alignment — verified, matches:**
+`web/src/fixtures/data.json` and `web/src/types.ts` were diffed field-by-field
+against `API_CONTRACT.md`. `Health`, `Device`, `Incident`, `Provenance`
+envelope, and the telemetry/forecast response shapes all match the contract
+exactly (same field names, same nesting). One integration note for when
+`internal/api` is built: `API_CONTRACT.md`'s forecast points use
+`"label": "+5m"` (string), but the Go domain type
+`internal/forecast.Point` currently uses `LabelMinutes int` — this is not a
+bug, it's expected: the API layer's response DTO must format
+`fmt.Sprintf("+%dm", p.LabelMinutes)` when serializing, keeping the internal
+domain model integer-typed (more testable) while the wire format matches the
+contract string. Recorded here so it isn't forgotten when `internal/api` is
+built.
+
+**Provenance/honesty discipline in `web/src/App.tsx` — verified, good:**
+The `gap()` helper explicitly labels any field NOT covered by a provenance
+envelope (e.g. "GPU utilization", "Inference latency", "Device count") as
+*"Not provenance-wrapped in API_CONTRACT.md"* rather than inventing a
+plausible-looking number. The Evaluation screen explicitly states "no
+fabricated score is shown" instead of hardcoding an accuracy percentage.
+The "Run scenario" button is correctly `disabled` since no live API exists
+yet — no fake success is simulated.
+
+**Confirmed gaps requiring follow-up (Writer, Phase 5 completion):**
+1. `web/src/styles.css` implements a **dark** theme
+   (`background:#0b1118`, `color:#e7edf5`) — the task requires a
+   "restrained **light** theme." This needs to be redone, not just
+   re-skinned at the margins.
+2. `grep -n "prefers-reduced-motion\|:focus\|transition" web/src/styles.css`
+   → **zero matches**. No focus-visible states, no transitions, no
+   reduced-motion media query anywhere. This fails the explicit
+   accessibility/motion requirements in the task and must be added.
+3. `deploy/compose/full.yml`'s `vyomm-api` service references image
+   `vyomm-api:local`, which does not exist yet (no Dockerfile/build defined
+   for the Go binary), and has no environment variables set
+   (`VYOMM_ENVIRONMENT_MODE`, `VYOMM_OTEL_EXPORTER_OTLP_ENDPOINT`, etc.) or a
+   `/data` volume for SQLite persistence. Expected at this stage (Go API
+   doesn't exist yet either) but tracked as a concrete follow-up once
+   `cmd/vyomm-api` exists.
+
+**Verified working, no changes needed:**
+- `deploy/otel/collector.yml`: OTLP receiver (grpc+http) → batch processor →
+  Jaeger OTLP exporter. Single traces pipeline, no fabricated metrics
+  pipeline — consistent with the architecture decision to have Prometheus
+  scrape `/metrics` directly rather than routing metrics through the
+  collector.
+- `deploy/prometheus/prometheus.yml`: single scrape job for `vyomm-api:8080`,
+  with an explicit comment that HAMi metrics are intentionally absent
+  pending Phase 4 discovery — correct restraint, matches
+  `METRICS_CONTRACT.md`.
+- Pinned versions in `deploy/compose/full.yml` match the versions recorded
+  in the original plan (Prometheus v2.55.1, Grafana 11.3.1, OTel Collector
+  Contrib 0.115.0, Jaeger 1.63, Loki 3.3.0).

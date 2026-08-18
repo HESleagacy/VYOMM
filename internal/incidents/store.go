@@ -148,3 +148,31 @@ func (s *Store) History(occurrenceKey string) []string {
 	copy(out, s.byOccurrence[occurrenceKey])
 	return out
 }
+
+// Restore repopulates the in-memory Store directly from persisted rows,
+// without going through Upsert/Decide (which apply recurrence rules that
+// don't make sense when replaying already-decided history). This is what
+// makes persistence restoration on restart possible and correct: the
+// persistence layer loads rows from SQLite and calls Restore once at
+// startup rather than the Store starting empty forever (the original
+// Python defect this project fixes).
+//
+// incidentsByKey must already be ordered oldest-to-newest occurrence within
+// each OccurrenceKey (the persistence layer is responsible for that
+// ordering, typically via ORDER BY occurrence_sequence ASC).
+func (s *Store) Restore(all []Incident, decisions map[string][]Decision) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	for i := range all {
+		inc := all[i]
+		copyInc := inc
+		s.incidents[inc.ID] = &copyInc
+		s.byOccurrence[inc.OccurrenceKey] = append(s.byOccurrence[inc.OccurrenceKey], inc.ID)
+	}
+	for id, ds := range decisions {
+		out := make([]Decision, len(ds))
+		copy(out, ds)
+		s.decisions[id] = out
+	}
+}
