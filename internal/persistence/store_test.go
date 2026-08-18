@@ -276,6 +276,61 @@ func TestDecisions_AuditTrailPersistsAndRestores(t *testing.T) {
 	}
 }
 
+func TestIngest_DetectsAnomaliesFromValidRows(t *testing.T) {
+	dir := t.TempDir()
+	s, err := NewStore(filepath.Join(dir, "test.db"), time.Hour, time.Now())
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	defer s.Close()
+
+	now := time.Now().UTC()
+	critical := testDevice("rtr-01", 99, now) // triggers cpu_saturation anomaly
+	if _, err := s.Ingest([]telemetry.DeviceTelemetry{critical}, "run-1", now); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	anomalies := s.Anomalies()
+	if len(anomalies) == 0 {
+		t.Fatal("expected at least one detected anomaly for CPU=99")
+	}
+	found := false
+	for _, a := range anomalies {
+		if a.Signal == "cpu_saturation" && a.Device == "rtr-01" {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("expected a cpu_saturation anomaly for rtr-01, got %+v", anomalies)
+	}
+}
+
+func TestIngest_AnomaliesDedupeWithinDetectionWindow(t *testing.T) {
+	dir := t.TempDir()
+	s, err := NewStore(filepath.Join(dir, "test.db"), time.Hour, time.Now())
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	defer s.Close()
+
+	now := time.Now().UTC()
+	critical := testDevice("rtr-01", 99, now)
+	if _, err := s.Ingest([]telemetry.DeviceTelemetry{critical}, "run-1", now); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if _, err := s.Ingest([]telemetry.DeviceTelemetry{critical}, "run-1", now.Add(2*time.Second)); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	countCPU := 0
+	for _, a := range s.Anomalies() {
+		if a.Signal == "cpu_saturation" && a.Device == "rtr-01" {
+			countCPU++
+		}
+	}
+	if countCPU != 1 {
+		t.Errorf("expected exactly 1 deduplicated cpu_saturation anomaly within the detection window, got %d", countCPU)
+	}
+}
+
 func TestUpsertIncident_DeduplicatesWhileActive(t *testing.T) {
 	dir := t.TempDir()
 	s, err := NewStore(filepath.Join(dir, "test.db"), time.Hour, time.Now())

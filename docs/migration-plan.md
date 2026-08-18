@@ -223,6 +223,65 @@ after both agents' `go get` calls; all pinned versions preserved exactly
 (`client_golang` v1.20.5, `otel` family v1.32.0, `goose` v3.24.1,
 `modernc.org/sqlite` v1.34.4).
 
+## Milestone: first runnable VYOMM binary (`cmd/vyomm-api` + `internal/api`)
+
+This is the first point in the migration where VYOMM has an actual running
+server, not just tested library code. Built:
+
+- `internal/api` — HTTP handlers for every endpoint in `API_CONTRACT.md`
+  except scenario execution (honestly returns HTTP 501 `not_implemented`,
+  since `internal/scenarios` doesn't exist yet — no faked success). DTOs
+  live entirely in `internal/api/dto.go`, keeping domain types
+  (`forecast.Result`, `incidents.Incident`, `detection.Anomaly`) independent
+  of wire format. Explicit-allowlist CORS (`withCORS`), no wildcard.
+  Prometheus HTTP metrics middleware records duration/count per route
+  pattern + method + status class (never per raw path, keeping cardinality
+  bounded). 15/15 tests pass, including
+  `TestDecideIncident_ThenRecurAfterResolution` — the same recurrence
+  regression proven in `internal/incidents`/`internal/persistence`, now
+  proven again through the actual HTTP layer end-to-end.
+- Added anomaly storage to `internal/persistence.Store` (bounded in-memory
+  ring buffer, deliberately NOT persisted to SQLite since anomalies are
+  cheaply re-derivable from telemetry — documented as a deliberate design
+  choice, not a repeat of the "written but never restored" defect). 2 new
+  tests (`TestIngest_DetectsAnomaliesFromValidRows`,
+  `TestIngest_AnomaliesDedupeWithinDetectionWindow`) pass.
+- `cmd/vyomm-api` — wires config, structured logging, persistence,
+  runbooks, and Prometheus metrics into a real `net/http` server with
+  graceful shutdown (`signal.NotifyContext`) and a background retention
+  pruning goroutine (`startRetentionPruning`, interval = retention/4,
+  clamped to [1m, 1h]) — this is what actually calls `Store.Prune` on a
+  schedule in production, closing the gap noted in the previous checkpoint.
+
+**Live process verification performed (not just `go test`):** built the
+real binary (`go build -o vyomm-api ./cmd/vyomm-api`), ran it against a
+temp SQLite file, and via `curl` against the live HTTP server:
+- `/healthz`, `POST/GET /api/v1/telemetry`, `/api/v1/anomalies`,
+  `/api/v1/incidents`, `/api/v1/forecast`, `/api/v1/runbook` all returned
+  correct, contract-shaped JSON.
+- Ingesting a device with `cpu_percent=99, memory_percent=96` produced a
+  real `Memory Leak` incident and two real anomalies (`cpu_saturation`,
+  `memory_pressure`), both severity `critical`, confirming detection rules
+  fire correctly through the full HTTP path.
+- `/metrics` returned real Prometheus exposition format with actual
+  histogram buckets from the requests just made
+  (`vyomm_http_request_duration_seconds_bucket`), not a placeholder.
+- **Killed the live process, restarted it against the same SQLite file**:
+  the previously-ingested telemetry and the previously-resolved incident
+  were both present in the fresh process's responses — the persistence
+  restore fix verified at the process level, not just in `go test`.
+
+Full repo: `go build ./...` clean, `go vet ./...` clean, `gofmt -l .`
+empty, `go test ./... -race` → **12 packages, 80 tests, all passing**
+(verified via `go test ./... -v -race | grep -c "^--- PASS"` = 80).
+
+Not yet done: `internal/api` doesn't yet call into
+`internal/observability/tracing` (spans aren't emitted from handlers yet —
+the package exists and is tested standalone, but nothing calls
+`tracing.Tracer(...).Start(...)` from the HTTP layer); scenario execution
+endpoints are stubs; no Dockerfile has been built into an actual image yet
+(only validated as Go source + `go build` of the target binary).
+
 ## Phase 4 progress (Thinker agent — HAMi/kind design)
 
 Delivered: `docs/hami-design-spec.md`, `docs/modes.md`,
