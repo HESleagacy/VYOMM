@@ -1,0 +1,30 @@
+# kind cluster configuration for VYOMM HAMi lab environments.
+#
+# UNVERIFIED: This config has not been tested on a live cluster.
+# The Controller must validate by running `kind create cluster --config <this-file>`.
+#
+# Used by both trial and nvml-mock modes.
+# Single control-plane node — designed to fit within 4 CPU / 7.6 GiB RAM.
+#
+# Reference: https://kind.sigs.k8s.io/docs/user/configuration/
+
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+
+nodes:
+  - role: control-plane
+    # Single node is sufficient for both trial and nvml-mock modes.
+    # Adding worker nodes would exceed the resource budget on this machine.
+    #
+    # Taints: control-plane taint is removed by default in kind,
+    # so workloads can schedule on this node.
+
+# Networking: use default kindnet CNI.
+# No extra port mappings needed — VYOMM runs outside the cluster
+# and connects via `kubectl port-forward` or NodePort.
+
+# Resource note: kind nodes are Docker containers.
+# The control-plane container itself uses ~500-700 MiB RAM.
+# Total overhead with HAMi components: ~1.5 GiB.
+# On a 7.6 GiB machine with 1.2 GiB available, this WILL cause
+# swap pressure. `make doctor` should warn about this.

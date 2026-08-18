@@ -1,0 +1,6 @@
+global:
+  scrape_interval: 15s
+scrape_configs:
+  - job_name: vyomm
+    static_configs: [{targets: ["vyomm-api:8080"]}]
+  # HAMi metric names are intentionally absent until Phase 4 discovery.

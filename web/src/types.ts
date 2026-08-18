@@ -1,0 +1,7 @@
+export type Mode = "trial" | "nvml-mock" | "real-gpu";
+export type Source = "synthetic" | "mock" | "real" | "computed";
+export type Provenance<T = number | string | null> = { value: T; unit: string; source: Source; mode: Mode; observed_at: string; run_id: string; unavailable_reason?: string };
+export type Health = { status: string; mode: Mode; checks: Record<string, string>; version: string; run_id: string };
+export type Device = { hostname: string; role: string; cpu_percent: number; memory_percent: number; bandwidth_percent: number; temperature_c: number; latency_ms: number; packet_loss_percent: number; uptime_seconds: number; status: string; observed_at: string; source: Source; mode: Mode };
+export type Incident = { id: string; occurrence_key: string; occurrence_sequence: number; severity: string; affected_devices: string[]; root_cause: string; status: string; created_at: string; updated_at: string; confidence: number; predicted_sla_breach_minutes: number; recommended_action: string };
+export type AppData = { health: Health; telemetry: { devices: Device[]; server_time: string; mode: Mode }; incidents: { active: Incident | null; items: Incident[] }; forecast: { device: string; method: string; horizon_minutes: number; confidence: Provenance; points: Array<{ label: string; cpu_percent: number; latency_ms: number; packet_loss_percent: number }> }; scenarios: Array<{ name: string; description?: string }> };
