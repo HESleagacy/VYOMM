@@ -5,6 +5,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/GrandRegentSarva/VYOMM/internal/detection"
 	"github.com/GrandRegentSarva/VYOMM/internal/incidents"
 	"github.com/GrandRegentSarva/VYOMM/internal/telemetry"
 )
@@ -286,9 +287,14 @@ func TestIngest_DetectsAnomaliesFromValidRows(t *testing.T) {
 
 	now := time.Now().UTC()
 	critical := testDevice("rtr-01", 99, now) // triggers cpu_saturation anomaly
-	if _, err := s.Ingest([]telemetry.DeviceTelemetry{critical}, "run-1", now); err != nil {
+	result, err := s.Ingest([]telemetry.DeviceTelemetry{critical}, "run-1", now)
+	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
+	// Detection is now a separate step from Ingest (see RecordAnomalies'
+	// doc comment) so callers can trace it independently; this exercises
+	// the same two-step sequence the HTTP handler uses.
+	s.RecordAnomalies(detection.Detect(result.ValidDevices, now))
 	anomalies := s.Anomalies()
 	if len(anomalies) == 0 {
 		t.Fatal("expected at least one detected anomaly for CPU=99")
@@ -314,12 +320,16 @@ func TestIngest_AnomaliesDedupeWithinDetectionWindow(t *testing.T) {
 
 	now := time.Now().UTC()
 	critical := testDevice("rtr-01", 99, now)
-	if _, err := s.Ingest([]telemetry.DeviceTelemetry{critical}, "run-1", now); err != nil {
+	result1, err := s.Ingest([]telemetry.DeviceTelemetry{critical}, "run-1", now)
+	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if _, err := s.Ingest([]telemetry.DeviceTelemetry{critical}, "run-1", now.Add(2*time.Second)); err != nil {
+	s.RecordAnomalies(detection.Detect(result1.ValidDevices, now))
+	result2, err := s.Ingest([]telemetry.DeviceTelemetry{critical}, "run-1", now.Add(2*time.Second))
+	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
+	s.RecordAnomalies(detection.Detect(result2.ValidDevices, now.Add(2*time.Second)))
 	countCPU := 0
 	for _, a := range s.Anomalies() {
 		if a.Signal == "cpu_saturation" && a.Device == "rtr-01" {

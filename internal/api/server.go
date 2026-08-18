@@ -38,6 +38,11 @@ type Server struct {
 	Clock    Clock
 	Version  string
 	RunID    string // the current process's run identifier, used as a default provenance run_id
+
+	// OTelStatus reflects whether tracing.Init actually succeeded at
+	// startup ("enabled") or not ("disabled" — the default zero value),
+	// so /healthz reports real status rather than a hardcoded string.
+	OTelStatus string
 }
 
 // NewMux builds the full HTTP routing table matching API_CONTRACT.md,
