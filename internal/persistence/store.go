@@ -15,6 +15,7 @@ import (
 	"github.com/pressly/goose/v3"
 	_ "modernc.org/sqlite"
 
+	"github.com/GrandRegentSarva/VYOMM/internal/detection"
 	"github.com/GrandRegentSarva/VYOMM/internal/incidents"
 	"github.com/GrandRegentSarva/VYOMM/internal/telemetry"
 )
@@ -32,12 +33,22 @@ type Store struct {
 	history map[string][]telemetry.DeviceTelemetry // hostname -> ordered samples (oldest first), bounded
 
 	incidents *incidents.Store
+
+	anomalies []detection.Anomaly // bounded ring buffer, most recent first
 }
 
 // maxHistoryPerDevice bounds the in-memory per-device history kept for
 // forecasting, independent of the SQLite retention window, so memory use
 // stays flat regardless of retention hours configured.
 const maxHistoryPerDevice = 90
+
+// maxAnomalies bounds the in-memory anomaly buffer. Anomalies are
+// intentionally NOT persisted to SQLite: they are cheaply re-derivable
+// from telemetry (internal/detection.Detect is a pure function of recent
+// telemetry), so losing them across a restart is a deliberate, documented
+// design choice, not a repeat of the "written but never restored" defect —
+// nothing about them is ever written and silently failed to be read back.
+const maxAnomalies = 100
 
 // Open opens (creating if necessary) the SQLite database at path and runs
 // all pending goose migrations. The returned *sql.DB is otherwise unused by
@@ -268,9 +279,41 @@ func (s *Store) Ingest(devices []telemetry.DeviceTelemetry, runID string, now ti
 	for _, d := range valid {
 		s.appendHistoryLocked(d)
 	}
+	newAnomalies := detection.Detect(valid, now)
+	s.addAnomaliesLocked(newAnomalies)
 	s.mu.Unlock()
 
 	return result, nil
+}
+
+// addAnomaliesLocked appends newly detected anomalies, deduplicating by ID
+// (detection.Detect already time-buckets IDs so repeated detections within
+// the same window naturally dedupe here) and enforcing maxAnomalies.
+// Caller must hold s.mu.
+func (s *Store) addAnomaliesLocked(newAnomalies []detection.Anomaly) {
+	existing := make(map[string]bool, len(s.anomalies))
+	for _, a := range s.anomalies {
+		existing[a.ID] = true
+	}
+	for _, a := range newAnomalies {
+		if existing[a.ID] {
+			continue
+		}
+		s.anomalies = append([]detection.Anomaly{a}, s.anomalies...) // most recent first
+		existing[a.ID] = true
+	}
+	if len(s.anomalies) > maxAnomalies {
+		s.anomalies = s.anomalies[:maxAnomalies]
+	}
+}
+
+// Anomalies returns the current bounded anomaly buffer, most recent first.
+func (s *Store) Anomalies() []detection.Anomaly {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	out := make([]detection.Anomaly, len(s.anomalies))
+	copy(out, s.anomalies)
+	return out
 }
 
 // LatestDevices returns the most recent known sample per device.
