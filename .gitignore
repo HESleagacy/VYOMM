@@ -3,3 +3,21 @@ frontend/node_modules/
 frontend/dist/
 __pycache__/
 *.pyc
+
+# Go
+/data/
+*.db
+*.db-journal
+
+# web (new Go-era frontend)
+web/node_modules/
+web/dist/
+web/.vite/
+
+# acceptance evidence: commit a small sanitized example only, not full runs
+artifacts/runs/*
+!artifacts/runs/.gitkeep
+
+# local logs / venv from earlier prototype runs
+*.log
+venv/

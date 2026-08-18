@@ -1,0 +1,24 @@
+# VYOMM HAMi Trial Mode — Helm Values Override
+#
+# UNVERIFIED: These values have not been tested on a live cluster.
+# Based on: https://project-hami.io/tutorials/labs/local-fake-gpu
+#
+# Usage:
+#   helm install hami hami-charts/hami \
+#     -n kube-system \
+#     --version 2.9.0 \
+#     -f deploy/hami/trial-values.yaml
+#
+# In trial mode, fake-gpu-operator provides the GPU device-plugin,
+# so HAMi's device-plugin must be disabled to avoid conflict.
+
+devicePlugin:
+  enabled: false
+
+# Scheduler is the only HAMi component active in trial mode.
+# It intercepts GPU pod scheduling decisions even with fake GPUs.
+scheduler:
+  # kubeScheduler.imageTag must match the kind node's Kubernetes version.
+  # The bootstrap script auto-detects this; the value below is a default.
+  kubeScheduler:
+    imageTag: "v1.32.2"
