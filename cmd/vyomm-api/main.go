@@ -21,6 +21,7 @@ import (
 	"github.com/GrandRegentSarva/VYOMM/internal/config"
 	"github.com/GrandRegentSarva/VYOMM/internal/observability/logging"
 	"github.com/GrandRegentSarva/VYOMM/internal/observability/metrics"
+	"github.com/GrandRegentSarva/VYOMM/internal/observability/tracing"
 	"github.com/GrandRegentSarva/VYOMM/internal/persistence"
 	"github.com/GrandRegentSarva/VYOMM/internal/runbooks"
 )
@@ -65,14 +66,38 @@ func main() {
 
 	metricsRegistry := metrics.New()
 
+	// Tracing is best-effort: a missing or unreachable OTel collector must
+	// never prevent the API from serving traffic. Init failure is logged
+	// and the server continues without exported traces (spans are still
+	// created via the no-op provider fallback, they just aren't exported
+	// anywhere) rather than crashing the whole process over an optional
+	// observability dependency.
+	otelStatus := "disabled"
+	initCtx, initCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	shutdownTracing, err := tracing.Init(initCtx, cfg.OTelExporterEndpoint, cfg.OTelTracesSampleRatio, "vyomm-api")
+	initCancel()
+	if err != nil {
+		logger.Warn("tracing initialization failed; continuing without exported traces", "event", "startup.tracing.failed", "error", err)
+	} else {
+		otelStatus = "enabled"
+		defer func() {
+			shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			if err := shutdownTracing(shutdownCtx); err != nil {
+				logger.Error("tracing shutdown error", "event", "shutdown.tracing.error", "error", err)
+			}
+		}()
+	}
+
 	server := &api.Server{
-		Store:    store,
-		Runbooks: runbookLib,
-		Metrics:  metricsRegistry,
-		Config:   cfg,
-		Logger:   logger,
-		Version:  version,
-		RunID:    runID,
+		Store:      store,
+		Runbooks:   runbookLib,
+		Metrics:    metricsRegistry,
+		Config:     cfg,
+		Logger:     logger,
+		Version:    version,
+		RunID:      runID,
+		OTelStatus: otelStatus,
 	}
 
 	httpServer := &http.Server{
