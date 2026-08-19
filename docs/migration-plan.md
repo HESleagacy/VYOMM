@@ -384,3 +384,70 @@ yet — no fake success is simulated.
 - Pinned versions in `deploy/compose/full.yml` match the versions recorded
   in the original plan (Prometheus v2.55.1, Grafana 11.3.1, OTel Collector
   Contrib 0.115.0, Jaeger 1.63, Loki 3.3.0).
+
+## Milestone: OpenTelemetry tracing wired into the live HTTP handlers
+
+Previously, `internal/observability/tracing` existed and was tested
+standalone, but nothing called `tracing.Init` and no handler created spans.
+This is now closed:
+
+- Decoupled anomaly detection from `persistence.Store.Ingest`
+  (`IngestResult.ValidDevices` + new `Store.RecordAnomalies` method) so the
+  HTTP layer can wrap detection in its own span instead of it happening
+  invisibly inside persistence. Updated the two existing tests that relied
+  on `Ingest`'s old auto-detection behavior to call
+  `detection.Detect(result.ValidDevices, now)` +
+  `Store.RecordAnomalies(...)` explicitly — same behavior, now traceable.
+- `internal/api/handlers.go`: `handleIngestTelemetry` now starts a parent
+  span (`telemetry.ingested`) with two child spans
+  (`anomaly.detected`, `incident.correlated`), each carrying real
+  attributes (device/anomaly/incident counts, run/scenario IDs).
+  `handleRunbook` and `handleDecideIncident` each start their own span
+  (`runbook.retrieved`, `decision.recorded`).
+- `cmd/vyomm-api/main.go` now calls `tracing.Init` at startup with a 5s
+  timeout, treating failure as **non-fatal** (logs a warning, server
+  still starts — an optional observability dependency must never take
+  down the API). `/healthz`'s `otel_exporter` check now reports the real
+  `"enabled"`/`"disabled"` status instead of a hardcoded string.
+
+**Verification performed (Docker was unavailable in this environment — no
+`dockerd` running and no sudo to start it — so live Jaeger was not used;
+verified honestly with an equivalent, lower-level method instead):**
+1. Added `TestInit_ActuallyExportsOverHTTP` to
+   `internal/observability/tracing`: a fake OTLP collector
+   (`httptest.Server`) receives a real POST to `/v1/traces` with
+   `Content-Type: application/x-protobuf` when a span is created and the
+   provider is shut down. This also empirically disproved an earlier
+   suspected bug (that `otlptracehttp.WithURLPath("")` might override the
+   SDK's default `/v1/traces` path when the configured endpoint has no
+   path component, as `VYOMM_OTEL_EXPORTER_OTLP_ENDPOINT`'s default
+   `http://localhost:4318` does) — the default endpoint's exports arrive
+   at the correct path regardless.
+2. **Live process test**: built the real `vyomm-api` binary, ran a plain
+   Go HTTP listener as a stand-in collector on `:4319`, pointed
+   `VYOMM_OTEL_EXPORTER_OTLP_ENDPOINT` at it with
+   `VYOMM_OTEL_TRACES_SAMPLE_RATIO=1.0`, and drove a full workflow via
+   `curl` (ingest a CPU/memory-critical device → runbook query → resolve
+   the resulting incident). `/healthz` correctly reported
+   `"otel_exporter":"enabled"`. The stand-in collector logged a real
+   received export (`COLLECTOR received export #1,
+   content-type=application/x-protobuf`) covering the batched spans from
+   that workflow.
+
+**Explicitly not done yet:** cross-request trace continuity. The two
+earliest workflow steps (`scenario.started`, `telemetry.generated`) happen
+in `cmd/vyomm-simulator`, which does not propagate trace context over HTTP
+yet, and incidents don't yet carry a stored trace ID linking a later
+`runbook.retrieved`/`decision.recorded` request back to the originating
+`telemetry.ingested` trace — each of those currently starts its own root
+span rather than continuing one end-to-end trace. This is flagged in code
+comments in `internal/api/handlers.go` and tracked here as a concrete
+follow-up, not silently glossed over. A real Jaeger/Docker-based visual
+check of the trace waterfall also remains outstanding pending Docker
+availability in this environment.
+
+Full repo after this milestone: `go build ./...` clean, `go vet ./...`
+clean, `gofmt -l .` empty, `go test ./... -race` → **12 packages, 81
+tests, all passing** (verified via
+`go test ./... -v | grep -c "^--- PASS"` = 81; one new test added this
+milestone, `TestInit_ActuallyExportsOverHTTP`).

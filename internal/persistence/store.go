@@ -220,11 +220,14 @@ func (s *Store) appendHistoryLocked(d telemetry.DeviceTelemetry) {
 
 // IngestResult reports how many devices were accepted/rejected and why, so
 // ingestion never silently drops invalid rows without a reason (per
-// API_CONTRACT.md's POST /api/v1/telemetry contract).
+// API_CONTRACT.md's POST /api/v1/telemetry contract). ValidDevices is
+// exposed so callers (the HTTP handler) can run anomaly detection as a
+// separate, independently-traceable step without re-validating.
 type IngestResult struct {
-	Accepted int
-	Rejected int
-	Errors   []string
+	Accepted     int
+	Rejected     int
+	Errors       []string
+	ValidDevices []telemetry.DeviceTelemetry
 }
 
 // Ingest validates and stores a batch of device telemetry. Invalid rows are
@@ -279,11 +282,22 @@ func (s *Store) Ingest(devices []telemetry.DeviceTelemetry, runID string, now ti
 	for _, d := range valid {
 		s.appendHistoryLocked(d)
 	}
-	newAnomalies := detection.Detect(valid, now)
-	s.addAnomaliesLocked(newAnomalies)
 	s.mu.Unlock()
 
+	result.ValidDevices = valid
 	return result, nil
+}
+
+// RecordAnomalies appends already-detected anomalies to the bounded buffer.
+// Detection itself (internal/detection.Detect) is deliberately NOT called
+// from inside Ingest: the HTTP layer runs it as a separate step (using
+// IngestResult.ValidDevices) so it can be wrapped in its own tracing span
+// ("anomaly.detected"), matching the bounded seven-step workflow instead of
+// bundling ingestion and detection into one opaque operation.
+func (s *Store) RecordAnomalies(newAnomalies []detection.Anomaly) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.addAnomaliesLocked(newAnomalies)
 }
 
 // addAnomaliesLocked appends newly detected anomalies, deduplicating by ID

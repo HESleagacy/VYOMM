@@ -1,22 +1,39 @@
 package api
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"time"
 
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+
+	"github.com/GrandRegentSarva/VYOMM/internal/detection"
 	"github.com/GrandRegentSarva/VYOMM/internal/forecast"
 	"github.com/GrandRegentSarva/VYOMM/internal/incidents"
+	"github.com/GrandRegentSarva/VYOMM/internal/observability/tracing"
 	"github.com/GrandRegentSarva/VYOMM/internal/telemetry"
 )
 
 const timeRFC3339 = time.RFC3339
 
+// tracer is the package-wide tracer for the "vyomm-api" bounded workflow
+// spans. Safe to call even if tracing.Init was never invoked (e.g. in unit
+// tests): otel's global Tracer() delegates to a no-op provider until a real
+// one is set via SetTracerProvider, so handlers behave identically with or
+// without a configured exporter.
+var tracer = tracing.Tracer("vyomm-api")
+
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
+	otelStatus := s.OTelStatus
+	if otelStatus == "" {
+		otelStatus = "disabled"
+	}
 	checks := map[string]string{
 		"database":      "ok", // Store is constructed successfully at startup or the process would not be serving
 		"llm_provider":  "not_configured",
-		"otel_exporter": "disabled",
+		"otel_exporter": otelStatus,
 	}
 	writeJSON(w, http.StatusOK, healthDTO{
 		Status:  "ok",
@@ -27,19 +44,42 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// handleIngestTelemetry implements the bounded workflow's middle three
+// steps as one parent span with two child spans: telemetry.ingested
+// (this span) -> anomaly.detected -> incident.correlated. The two earlier
+// steps (scenario.started, telemetry.generated) happen in the simulator
+// process, which does not yet propagate trace context over HTTP (tracked
+// as a follow-up in docs/migration-plan.md); this handler always starts a
+// fresh root span rather than silently failing to continue a trace that
+// was never sent.
 func (s *Server) handleIngestTelemetry(w http.ResponseWriter, r *http.Request) {
+	ctx, span := tracer.Start(r.Context(), string(tracing.SpanTelemetryIngested))
+	defer span.End()
+
 	var req telemetryIngestRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		span.SetStatus(codes.Error, "malformed request body")
 		writeError(w, http.StatusBadRequest, "invalid_request", "malformed JSON body: "+err.Error())
 		return
 	}
+	span.SetAttributes(
+		attribute.String("vyomm.run_id", req.RunID),
+		attribute.String("vyomm.scenario_id", req.ScenarioID),
+		attribute.Int("vyomm.device_count", len(req.Devices)),
+	)
+
 	now := s.Clock.Now()
 	result, err := s.Store.Ingest(req.Devices, req.RunID, now)
 	if err != nil {
+		span.SetStatus(codes.Error, err.Error())
 		s.Logger.Error("telemetry ingest failed", "event", "telemetry.ingest.failed", "error", err)
 		writeError(w, http.StatusInternalServerError, "ingest_failed", "failed to persist telemetry batch")
 		return
 	}
+	span.SetAttributes(
+		attribute.Int("vyomm.accepted", result.Accepted),
+		attribute.Int("vyomm.rejected", result.Rejected),
+	)
 	if s.Metrics != nil {
 		mode := string(s.Config.EnvironmentMode)
 		if result.Accepted > 0 {
@@ -49,23 +89,36 @@ func (s *Server) handleIngestTelemetry(w http.ResponseWriter, r *http.Request) {
 			s.Metrics.TelemetryIngestionErrors.WithLabelValues(mode, "validation").Add(float64(result.Rejected))
 		}
 	}
-	s.correlateIncidents(req.Devices, now)
+
+	s.detectAnomalies(ctx, result.ValidDevices, now)
+	s.correlateIncidents(ctx, result.ValidDevices, now)
 	writeJSON(w, http.StatusOK, telemetryIngestResponse{Accepted: result.Accepted, Rejected: result.Rejected, Errors: result.Errors})
 }
 
+// detectAnomalies is the "anomaly.detected" step of the bounded workflow, a
+// child span of the ingest span carried in ctx.
+func (s *Server) detectAnomalies(ctx context.Context, devices []telemetry.DeviceTelemetry, now time.Time) {
+	_, span := tracer.Start(ctx, string(tracing.SpanAnomalyDetected))
+	defer span.End()
+	anomalies := detection.Detect(devices, now)
+	s.Store.RecordAnomalies(anomalies)
+	span.SetAttributes(attribute.Int("vyomm.anomalies_detected", len(anomalies)))
+}
+
 // correlateIncidents runs the incident correlation rules against the
-// ingested batch and upserts any matches, matching the original behavior
-// of correlating on every ingest rather than on a separate poll loop.
-func (s *Server) correlateIncidents(devices []telemetry.DeviceTelemetry, now time.Time) {
-	valid := make([]telemetry.DeviceTelemetry, 0, len(devices))
-	for _, d := range devices {
-		if d.Validate() == nil {
-			valid = append(valid, d)
-		}
-	}
+// already-validated batch and upserts any matches, matching the original
+// behavior of correlating on every ingest rather than on a separate poll
+// loop. This is the "incident.correlated" step of the bounded workflow.
+func (s *Server) correlateIncidents(ctx context.Context, valid []telemetry.DeviceTelemetry, now time.Time) {
+	_, span := tracer.Start(ctx, string(tracing.SpanIncidentCorrelated))
+	defer span.End()
 	candidates := incidents.Correlate(valid)
+	createdCount := 0
 	for _, c := range candidates {
 		_, created, err := s.Store.UpsertIncident(c, now)
+		if created {
+			createdCount++
+		}
 		if err != nil {
 			s.Logger.Error("incident upsert failed", "event", "incident.upsert.failed", "error", err, "occurrence_key", c.OccurrenceKey)
 			continue
@@ -75,6 +128,7 @@ func (s *Server) correlateIncidents(devices []telemetry.DeviceTelemetry, now tim
 			s.Metrics.IncidentsActive.WithLabelValues(mode, string(c.Severity)).Inc()
 		}
 	}
+	span.SetAttributes(attribute.Int("vyomm.incidents_created", createdCount))
 }
 
 func (s *Server) handleGetTelemetry(w http.ResponseWriter, r *http.Request) {
@@ -145,20 +199,34 @@ func (s *Server) handleListIncidents(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, incidentsListResponse{Active: activeDTO, Items: itemDTOs})
 }
 
+// handleDecideIncident implements the "decision.recorded" step of the
+// bounded workflow. Like handleRunbook, this starts a fresh root span
+// rather than continuing the originating ingest trace, since the incident
+// record does not yet carry a stored trace ID linking it back (tracked as
+// a follow-up in docs/migration-plan.md, alongside simulator-side context
+// propagation).
 func (s *Server) handleDecideIncident(w http.ResponseWriter, r *http.Request) {
+	_, span := tracer.Start(r.Context(), string(tracing.SpanDecisionRecorded))
+	defer span.End()
+
 	id := r.PathValue("id")
+	span.SetAttributes(attribute.String("vyomm.incident_id", id))
 	var req decisionRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		span.SetStatus(codes.Error, "malformed request body")
 		writeError(w, http.StatusBadRequest, "invalid_request", "malformed JSON body: "+err.Error())
 		return
 	}
 	status := incidents.Status(req.Status)
 	if status != incidents.StatusResolved && status != incidents.StatusIgnored {
+		span.SetStatus(codes.Error, "invalid status")
 		writeError(w, http.StatusBadRequest, "invalid_status", "status must be 'resolved' or 'ignored'")
 		return
 	}
+	span.SetAttributes(attribute.String("vyomm.decision_status", string(status)))
 	updated, err := s.Store.DecideIncident(id, status, req.Actor, s.Clock.Now())
 	if err != nil {
+		span.SetStatus(codes.Error, "incident not found")
 		writeError(w, http.StatusNotFound, "not_found", "incident not found: "+id)
 		return
 	}
@@ -178,16 +246,23 @@ func (s *Server) handleDecisions(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, out)
 }
 
+// handleRunbook implements the "runbook.retrieved" step of the bounded
+// workflow.
 func (s *Server) handleRunbook(w http.ResponseWriter, r *http.Request) {
+	_, span := tracer.Start(r.Context(), string(tracing.SpanRunbookRetrieved))
+	defer span.End()
+
 	query := r.URL.Query().Get("query")
 	if query == "" {
 		query = "network incident"
 	}
+	span.SetAttributes(attribute.String("vyomm.query", query))
 	if s.Runbooks == nil {
 		writeJSON(w, http.StatusOK, []runbookDTO{})
 		return
 	}
 	results := s.Runbooks.Retrieve(query, 2)
+	span.SetAttributes(attribute.Int("vyomm.results", len(results)))
 	out := make([]runbookDTO, len(results))
 	for i, res := range results {
 		out[i] = toRunbookDTO(res)
