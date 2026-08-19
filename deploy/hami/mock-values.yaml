@@ -1,0 +1,29 @@
+# VYOMM HAMi nvml-mock Mode — Helm Values Override
+#
+# UNVERIFIED: These values have not been tested on a live cluster.
+# Based on: https://project-hami.io/tutorials/labs/nvml-mock
+#
+# Usage (with locally-built HAMi image):
+#   helm install hami ./charts/hami \
+#     -n kube-system \
+#     -f deploy/hami/mock-values.yaml
+#
+# In nvml-mock mode, HAMi's own device-plugin discovers GPUs via NVML.
+# The device-plugin is enabled and uses the locally-built image.
+
+devicePlugin:
+  enabled: true
+  image:
+    repository: hami
+    tag: local
+  # Points HAMi at the fake driver libraries installed by nvml-mock
+  nvidiaDriverRoot: /var/lib/nvml-mock/driver
+
+scheduler:
+  image:
+    repository: hami
+    tag: local
+  # kubeScheduler.imageTag must match the kind node's Kubernetes version.
+  # The bootstrap script auto-detects this; the value below is a default.
+  kubeScheduler:
+    imageTag: "v1.32.2"

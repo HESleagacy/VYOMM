@@ -1,0 +1,21 @@
+services:
+  vyomm-api:
+    image: vyomm-api:local
+    ports: ["8080:8080"]
+  prometheus:
+    image: prom/prometheus:v2.55.1
+    volumes: ["../prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro"]
+    ports: ["9090:9090"]
+  grafana:
+    image: grafana/grafana:11.3.1
+    ports: ["3000:3000"]
+    volumes: ["../grafana/provisioning:/etc/grafana/provisioning:ro", "../grafana/dashboards:/var/lib/grafana/dashboards:ro"]
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:0.115.0
+    command: ["--config=/etc/otelcol-contrib/collector.yml"]
+    volumes: ["../otel/collector.yml:/etc/otelcol-contrib/collector.yml:ro"]
+  jaeger:
+    image: jaegertracing/all-in-one:1.63
+    ports: ["16686:16686"]
+  loki:
+    image: grafana/loki:3.3.0
