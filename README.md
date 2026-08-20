@@ -1,54 +1,113 @@
 # VYOMM
 
-Predictive NOC Copilot demonstration with simulated telemetry, forecasting, anomaly detection, incident correlation, runbook retrieval, and Groq-powered incident analysis.
+Predictive NOC (Network Operations Center) Copilot demonstration, being
+re-engineered as a **GPU-observability engineering project** built around HAMi
+(Heterogeneous AI Computing virtualization middleware) on Kubernetes.
 
-## Run
+The end-to-end workflow it models:
+
+```
+Telemetry Ingest → Forecast → Anomaly Detection → Incident Correlation
+                 → Runbook Retrieval → Copilot Reasoning → Human Approval
+```
+
+## Current state
+
+VYOMM is mid-migration from a legacy Python/FastAPI prototype to a **Go
+rewrite**. All active engineering is in the Go implementation, which is real,
+test-driven, and runnable:
+
+| Area | Status |
+|---|---|
+| Go backend API (`cmd/vyomm-api`, `internal/api`) | **Working, tested, runs live** |
+| Go domain logic (telemetry/detection/forecast/incidents/runbooks) | **Complete, tested** |
+| Persistence (SQLite + goose migrations, restart restore, retention) | **Complete, tested** |
+| Observability (Prometheus metrics, OTel tracing, structured logging) | **Complete, tested** |
+| Go simulator (`cmd/vyomm-simulator`) | Minimal placeholder (one batch, exits) |
+| Scenario engine (`internal/scenarios`) | Not started (endpoints return 501) |
+| Evaluator (`cmd/vyomm-eval`) | Designed only |
+| HAMi / kind GPU integration | Design + scaffolding only, never run live |
+| Frontend (`web/`) | Scaffold, fixture-driven, not wired to live API |
+| Legacy Python stack (`backend/`, `simulator/`, `frontend/`) | Deprecated, retained for parity |
+
+A key project discipline: **no fabricated results**. Unimplemented endpoints
+return `501`, forecasting/retrieval are labeled by their real method
+(`linear-extrapolation`, `keyword-overlap`), and the UI refuses to render
+un-provenanced numbers as measurements. See `STATUS.md` for the detailed
+analysis.
+
+## Run the Go API
+
+Requires Go 1.25+. No LLM API key is required — the demo runs fully offline
+with a deterministic fallback analysis.
 
 ```bash
-docker compose up --build
+mkdir -p data                    # SQLite parent dir (default ./data/vyomm.db)
+go run ./cmd/vyomm-api
 ```
 
-Open:
+Open `http://localhost:8080`. On startup the API restores persisted state
+(SQLite), and a background goroutine prunes telemetry older than the retention
+window (default 24h).
 
-```text
-http://localhost:8080
+Optional environment overrides (see `.env.example`):
+
+```bash
+VYOMM_LLM_API_KEY=...            # enables the real LLM provider (OpenAI-compatible)
+VYOMM_SQLITE_PATH=./data/vyomm.db
+VYOMM_API_ADDR=:8080
+VYOMM_OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4318   # optional OTel/Jaeger
 ```
 
-No manual setup is required for demo mode. A `.env` file can provide `GROQ_API_KEY`; when the key is present the backend calls Groq's OpenAI-compatible chat completions endpoint. If the key is missing, the demo uses a deterministic Groq-style fallback so the judges still see the complete flow.
+## Endpoints
 
-## Services
+All under `http://localhost:8080`:
 
-- `frontend`: React, TypeScript, Vite, TailwindCSS, React Flow, Recharts, Framer Motion
-- `backend`: FastAPI API, SQLite event storage, correlation, forecast, anomaly, RAG, Groq orchestration
-- `simulator`: Python telemetry generator for 50 routers, 20 switches, 10 firewalls, and 5 gateways
-- `chromadb`: vector store for runbook retrieval
-- `nginx`: single public entrypoint on port `8080`
+- `GET /healthz` — real dependency status (DB liveness, LLM config, OTel)
+- `POST /api/v1/telemetry` — ingest a device telemetry batch (used by the simulator)
+- `GET /api/v1/telemetry` — latest known device state (restored across restarts)
+- `GET /api/v1/forecast?device=rtr-01` — honest `linear-extrapolation` forecast
+- `GET /api/v1/anomalies` — threshold-based anomaly detection results
+- `GET /api/v1/incidents` — correlated incidents with recurrence history
+- `POST /api/v1/incidents/{id}/decision` — approve/ignore an incident
+- `GET /api/v1/incidents/{id}/decisions` — decision audit trail
+- `GET /api/v1/runbook?query=...` — keyword-overlap runbook retrieval
+- `GET /api/v1/scenarios` — deterministic scenario list (see `docs/scenarios.md`)
+- `POST /api/v1/scenarios/{name}/run` — run a scenario (currently 501)
+- `GET /metrics` — Prometheus exposition format
 
-## Demo Behavior
+Every metric/value is wrapped in a provenance envelope (`source`, `mode`,
+`observed_at`, `run_id`). See `API_CONTRACT.md` (authoritative) and
+`METRICS_CONTRACT.md`.
 
-The system starts healthy, then triggers realistic incidents every 30-60 seconds. During an incident the topology highlights affected nodes, charts spike, correlation creates an incident, runbooks are retrieved, and the Groq copilot endpoint returns a structured recommendation. Approving an incident marks it resolved and the next simulator cycle naturally recovers.
+## Observability
 
-## Flow
+- `GET /metrics` — Prometheus; all 15 `vyomm_*` metrics per `METRICS_CONTRACT.md`
+- OTel traces (exported via OTLP/HTTP to Jaeger/collector) — best-effort: a
+  missing collector never takes down the API
+- Structured JSON logging (redacting) via `slog`
 
-The dashboard includes a NOC Copilot Flow panel:
+## Testing
 
-1. Telemetry Ingest
-2. Chronos-style Forecast
-3. Anomaly Detection
-4. Incident Correlation
-5. Runbook Retrieval
-6. Groq Copilot Reasoning
-7. Human Approval
+```bash
+go build ./... && go vet ./... && gofmt -l .
+go test ./...        # all packages pass
+```
 
-## API
+CI (`.github/workflows/ci.yml`) runs build/vet/gofmt/test-race plus the web
+job on every push.
 
-- `GET /api/telemetry`
-- `POST /api/telemetry`
-- `GET /api/forecast`
-- `GET /api/anomalies`
-- `GET /api/incidents`
-- `POST /api/incidents/{incident_id}`
-- `GET /api/topology`
-- `GET /api/llm`
-- `GET /api/runbook`
-- `GET /api/flow`
+## Documentation
+
+- `STATUS.md` — honest project status and code-review findings
+- `docs/migration-plan.md` — phase tracking for the Python→Go migration
+- `docs/scenarios.md` — the 9 deterministic scenarios (ground truth)
+- `docs/modes.md` — `trial` / `nvml-mock` / `real-gpu` operating modes
+- `docs/hami-design-spec.md` — HAMi design, `deploy/hami/` scaffolding
+
+## Legacy Python stack
+
+The original hackathon prototype (`backend/`, `simulator/`, `frontend/`) is
+still runnable via `docker-compose.yml`, but is deprecated and slated for
+removal once the Go rewrite reaches feature parity. It is retained only as a
+reference.
