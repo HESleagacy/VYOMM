@@ -5,6 +5,7 @@
 package persistence
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
 	"fmt"
@@ -103,6 +104,14 @@ func NewStore(path string, retention time.Duration, now time.Time) (*Store, erro
 // Close closes the underlying database connection.
 func (s *Store) Close() error {
 	return s.db.Close()
+}
+
+// Ping verifies the database connection is alive, backing the real
+// (non-static) database dependency check reported by /healthz. It honors
+// the caller's context so a health probe can bound how long it waits on the
+// single serialized SQLite connection.
+func (s *Store) Ping(ctx context.Context) error {
+	return s.db.PingContext(ctx)
 }
 
 // DB exposes the raw connection for tests that need to assert on stored
@@ -396,29 +405,32 @@ func (s *Store) UpsertIncident(c incidents.Candidate, now time.Time) (incidents.
 
 // DecideIncident records a decision through incidents.Store and persists
 // both the updated incident status and the audit-trail row.
-func (s *Store) DecideIncident(incidentID string, status incidents.Status, actor string, now time.Time) (incidents.Incident, error) {
-	inc, err := s.incidents.Decide(incidentID, status, actor, now)
+// wasActive reports whether the incident was active immediately before this
+// decision, propagated from incidents.Store.Decide so the HTTP layer can
+// keep the vyomm_incidents_active gauge accurate.
+func (s *Store) DecideIncident(incidentID string, status incidents.Status, actor string, now time.Time) (incidents.Incident, bool, error) {
+	inc, wasActive, err := s.incidents.Decide(incidentID, status, actor, now)
 	if err != nil {
-		return incidents.Incident{}, err
+		return incidents.Incident{}, false, err
 	}
 	tx, err := s.db.Begin()
 	if err != nil {
-		return inc, fmt.Errorf("persistence: begin decide tx: %w", err)
+		return inc, wasActive, fmt.Errorf("persistence: begin decide tx: %w", err)
 	}
 	if _, err := tx.Exec(`UPDATE incidents SET status = ?, updated_at = ? WHERE id = ?`,
 		inc.Status, inc.UpdatedAt.UTC().Format(time.RFC3339), inc.ID); err != nil {
 		tx.Rollback()
-		return inc, fmt.Errorf("persistence: update incident status: %w", err)
+		return inc, wasActive, fmt.Errorf("persistence: update incident status: %w", err)
 	}
 	if _, err := tx.Exec(`INSERT INTO incident_decisions(incident_id, status, actor, decided_at) VALUES (?, ?, ?, ?)`,
 		inc.ID, status, actor, now.UTC().Format(time.RFC3339)); err != nil {
 		tx.Rollback()
-		return inc, fmt.Errorf("persistence: insert decision row: %w", err)
+		return inc, wasActive, fmt.Errorf("persistence: insert decision row: %w", err)
 	}
 	if err := tx.Commit(); err != nil {
-		return inc, fmt.Errorf("persistence: commit decide tx: %w", err)
+		return inc, wasActive, fmt.Errorf("persistence: commit decide tx: %w", err)
 	}
-	return inc, nil
+	return inc, wasActive, nil
 }
 
 // ActiveIncident, ListIncidents, and Decisions pass through to the

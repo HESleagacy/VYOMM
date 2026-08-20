@@ -71,23 +71,31 @@ func (s *Store) Upsert(c Candidate, now time.Time) (incident Incident, created b
 // Decide records a human decision against an incident and updates its
 // status accordingly. Returns an error if the incident does not exist so
 // callers can return a proper 404 rather than silently succeeding.
-func (s *Store) Decide(incidentID string, status Status, actor string, now time.Time) (Incident, error) {
+//
+// wasActive reports whether the incident was in the active state
+// immediately before this decision. Callers use it to keep the
+// vyomm_incidents_active gauge accurate: the gauge must be decremented
+// exactly once, when an incident leaves the active state, and never when a
+// decision is applied to an already-resolved/ignored incident (which would
+// otherwise drive the gauge negative).
+func (s *Store) Decide(incidentID string, status Status, actor string, now time.Time) (inc Incident, wasActive bool, err error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	inc, ok := s.incidents[incidentID]
+	existing, ok := s.incidents[incidentID]
 	if !ok {
-		return Incident{}, fmt.Errorf("incident %q not found", incidentID)
+		return Incident{}, false, fmt.Errorf("incident %q not found", incidentID)
 	}
-	inc.Status = status
-	inc.UpdatedAt = now
+	wasActive = existing.Status == StatusActive
+	existing.Status = status
+	existing.UpdatedAt = now
 	s.decisions[incidentID] = append(s.decisions[incidentID], Decision{
 		IncidentID: incidentID,
 		Status:     status,
 		Actor:      actor,
 		DecidedAt:  now,
 	})
-	return *inc, nil
+	return *existing, wasActive, nil
 }
 
 // Decisions returns the audit trail for one incident, oldest first.
