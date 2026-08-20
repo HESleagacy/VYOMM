@@ -112,7 +112,7 @@ func TestStore_ResolvedIncidentCanRecur(t *testing.T) {
 		t.Fatal("expected first occurrence to be created")
 	}
 
-	resolved, err := s.Decide(first.ID, StatusResolved, "test-user", time.Now())
+	resolved, _, err := s.Decide(first.ID, StatusResolved, "test-user", time.Now())
 	if err != nil {
 		t.Fatalf("unexpected error resolving incident: %v", err)
 	}
@@ -159,7 +159,7 @@ func TestStore_IgnoredIncidentCanAlsoRecur(t *testing.T) {
 	s := NewStore()
 	c := Candidate{OccurrenceKey: "Switch Overheating:sw-01", RootCause: "Switch Overheating", Severity: SeverityHigh, AffectedDevices: []string{"sw-01"}, Confidence: 0.8, SLABreachMinutes: 12, RecommendedAction: "fix"}
 	first, _ := s.Upsert(c, time.Now())
-	if _, err := s.Decide(first.ID, StatusIgnored, "user", time.Now()); err != nil {
+	if _, _, err := s.Decide(first.ID, StatusIgnored, "user", time.Now()); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	second, created := s.Upsert(c, time.Now().Add(time.Minute))
@@ -173,7 +173,7 @@ func TestStore_IgnoredIncidentCanAlsoRecur(t *testing.T) {
 
 func TestStore_DecideUnknownIncidentReturnsError(t *testing.T) {
 	s := NewStore()
-	_, err := s.Decide("INC-DOES-NOT-EXIST", StatusResolved, "user", time.Now())
+	_, _, err := s.Decide("INC-DOES-NOT-EXIST", StatusResolved, "user", time.Now())
 	if err == nil {
 		t.Fatal("expected error for unknown incident ID, got nil")
 	}

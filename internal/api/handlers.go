@@ -30,15 +30,49 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	if otelStatus == "" {
 		otelStatus = "disabled"
 	}
-	checks := map[string]string{
-		"database":      "ok", // Store is constructed successfully at startup or the process would not be serving
-		"llm_provider":  "not_configured",
-		"otel_exporter": otelStatus,
+
+	// Real database liveness check, not a static "ok": API_CONTRACT.md
+	// requires /healthz to report actual dependency status. A short timeout
+	// keeps the probe responsive even when the single serialized SQLite
+	// connection is momentarily busy.
+	dbStatus := "ok"
+	if s.Store == nil {
+		dbStatus = "unavailable"
+	} else {
+		pingCtx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
+		if err := s.Store.Ping(pingCtx); err != nil {
+			dbStatus = "error"
+			if s.Logger != nil {
+				s.Logger.Error("healthz database check failed", "event", "health.database.failed", "error", err)
+			}
+		}
+		cancel()
 	}
-	writeJSON(w, http.StatusOK, healthDTO{
-		Status:  "ok",
-		Mode:    string(s.Config.EnvironmentMode),
-		Checks:  checks,
+
+	// Reflect the real LLM configuration rather than a hardcoded string.
+	// The Go API does not call the provider itself yet, so a configured key
+	// reports "configured" and an empty key reports "fallback" (the
+	// deterministic offline analysis) — never claimed as "live".
+	llmStatus := "fallback"
+	if s.Config.HasRealLLMKey() {
+		llmStatus = "configured"
+	}
+
+	status := "ok"
+	code := http.StatusOK
+	if dbStatus != "ok" {
+		status = "degraded"
+		code = http.StatusServiceUnavailable
+	}
+
+	writeJSON(w, code, healthDTO{
+		Status: status,
+		Mode:   string(s.Config.EnvironmentMode),
+		Checks: map[string]string{
+			"database":      dbStatus,
+			"llm_provider":  llmStatus,
+			"otel_exporter": otelStatus,
+		},
 		Version: s.Version,
 		RunID:   s.RunID,
 	})
@@ -115,7 +149,7 @@ func (s *Server) correlateIncidents(ctx context.Context, valid []telemetry.Devic
 	candidates := incidents.Correlate(valid)
 	createdCount := 0
 	for _, c := range candidates {
-		_, created, err := s.Store.UpsertIncident(c, now)
+		inc, created, err := s.Store.UpsertIncident(c, now)
 		if created {
 			createdCount++
 		}
@@ -126,6 +160,13 @@ func (s *Server) correlateIncidents(ctx context.Context, valid []telemetry.Devic
 		if created && s.Metrics != nil {
 			mode := string(s.Config.EnvironmentMode)
 			s.Metrics.IncidentsActive.WithLabelValues(mode, string(c.Severity)).Inc()
+			// A newly-created occurrence with sequence > 1 is a recurrence:
+			// this fault+device fired again after a prior occurrence was
+			// resolved or ignored. This is exactly what
+			// vyomm_incidents_recurred_total counts per METRICS_CONTRACT.md.
+			if inc.OccurrenceSequence > 1 {
+				s.Metrics.IncidentsRecurred.WithLabelValues(mode).Inc()
+			}
 		}
 	}
 	span.SetAttributes(attribute.Int("vyomm.incidents_created", createdCount))
@@ -224,14 +265,25 @@ func (s *Server) handleDecideIncident(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	span.SetAttributes(attribute.String("vyomm.decision_status", string(status)))
-	updated, err := s.Store.DecideIncident(id, status, req.Actor, s.Clock.Now())
+	updated, wasActive, err := s.Store.DecideIncident(id, status, req.Actor, s.Clock.Now())
 	if err != nil {
 		span.SetStatus(codes.Error, "incident not found")
 		writeError(w, http.StatusNotFound, "not_found", "incident not found: "+id)
 		return
 	}
-	if s.Metrics != nil && status == incidents.StatusResolved {
-		s.Metrics.IncidentsResolved.WithLabelValues(string(s.Config.EnvironmentMode), string(updated.Severity)).Inc()
+	if s.Metrics != nil {
+		mode := string(s.Config.EnvironmentMode)
+		// Decrement the active gauge only when the incident actually left
+		// the active state, so it mirrors the increment done at creation and
+		// never goes negative if an already-decided incident is decided
+		// again. Fixes the previously write-only (monotonically growing)
+		// vyomm_incidents_active gauge.
+		if wasActive {
+			s.Metrics.IncidentsActive.WithLabelValues(mode, string(updated.Severity)).Dec()
+		}
+		if status == incidents.StatusResolved {
+			s.Metrics.IncidentsResolved.WithLabelValues(mode, string(updated.Severity)).Inc()
+		}
 	}
 	writeJSON(w, http.StatusOK, toIncidentDTO(updated))
 }

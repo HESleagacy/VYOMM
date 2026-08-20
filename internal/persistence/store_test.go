@@ -152,7 +152,7 @@ func TestRestore_RecurrenceHistoryPreservedAcrossRestart(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if _, err := s1.DecideIncident(first.ID, incidents.StatusResolved, "user", now); err != nil {
+	if _, _, err := s1.DecideIncident(first.ID, incidents.StatusResolved, "user", now); err != nil {
 		t.Fatalf("unexpected error resolving: %v", err)
 	}
 	if err := s1.Close(); err != nil {
@@ -239,7 +239,7 @@ func TestDecideIncident_UnknownIDReturnsError(t *testing.T) {
 	}
 	defer s.Close()
 
-	if _, err := s.DecideIncident("INC-MISSING", incidents.StatusResolved, "user", time.Now()); err == nil {
+	if _, _, err := s.DecideIncident("INC-MISSING", incidents.StatusResolved, "user", time.Now()); err == nil {
 		t.Fatal("expected error for unknown incident ID")
 	}
 }
@@ -258,7 +258,7 @@ func TestDecisions_AuditTrailPersistsAndRestores(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if _, err := s1.DecideIncident(inc.ID, incidents.StatusIgnored, "alice", now); err != nil {
+	if _, _, err := s1.DecideIncident(inc.ID, incidents.StatusIgnored, "alice", now); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	if err := s1.Close(); err != nil {
@@ -318,7 +318,11 @@ func TestIngest_AnomaliesDedupeWithinDetectionWindow(t *testing.T) {
 	}
 	defer s.Close()
 
-	now := time.Now().UTC()
+	// Use a minute-aligned timestamp (divisible by the 20s detection bucket)
+	// so the two ingests below deterministically fall in the same dedup
+	// window. Using time.Now() made this test flake ~10% of the time when
+	// the two calls straddled a bucket boundary.
+	now := time.Date(2026, 8, 18, 12, 0, 0, 0, time.UTC)
 	critical := testDevice("rtr-01", 99, now)
 	result1, err := s.Ingest([]telemetry.DeviceTelemetry{critical}, "run-1", now)
 	if err != nil {
